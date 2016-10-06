@@ -174,6 +174,108 @@ cpArbiterApplyImpulse_NEON(cpArbiter *arb)
 
 #endif
 
+#if __SSE3__
+#include "tmmintrin.h"
+
+static inline __m128d vrev(__m128d a) {
+	return (__m128d){a[1], a[0]};
+}
+
+static inline __m128d vneg(__m128d a) {
+	return _mm_sub_pd(_mm_setzero_pd(), a);
+}
+
+static void
+cpArbiterApplyImpulse_SSE3(cpArbiter *arb)
+{
+	cpBody *a = arb->body_a;
+	cpBody *b = arb->body_b;
+	__m128d surface_vr = _mm_loadu_pd((double*)&arb->surface_vr);
+	__m128d n = _mm_loadu_pd((double*)&arb->n);
+	double friction = arb->u;
+
+	int numContacts = arb->count;
+	struct cpContact *contacts = arb->contacts;
+	for(int i=0; i<numContacts; i++){
+		struct cpContact *con = contacts + i;
+		__m128d r1 = _mm_loadu_pd((double*)&con->r1);
+		__m128d r2 = _mm_loadu_pd((double*)&con->r2);
+
+		__m128d perp = _mm_setr_pd(-1.0, 1.0);
+		__m128d r1p = _mm_mul_pd(vrev(r1), perp);
+		__m128d r2p = _mm_mul_pd(vrev(r2), perp);
+
+		__m128d vBias_a = _mm_loadu_pd((double*)&a->v_bias);
+		__m128d vBias_b = _mm_loadu_pd((double*)&b->v_bias);
+		__m128d wBias = _mm_setr_pd(a->w_bias, b->w_bias);
+
+		__m128d vb1 = _mm_add_pd(vBias_a, _mm_mul_pd(r1p, _mm_set1_pd(wBias[0])));
+		__m128d vb2 = _mm_add_pd(vBias_b, _mm_mul_pd(r2p, _mm_set1_pd(wBias[1])));
+		__m128d vbr = _mm_sub_pd(vb2, vb1);
+
+		__m128d v_a = _mm_loadu_pd((double*)&a->v);
+		__m128d v_b = _mm_loadu_pd((double*)&b->v);
+		__m128d w = _mm_setr_pd(a->w, b->w);
+		__m128d v1 = _mm_add_pd(v_a, _mm_mul_pd(r1p, _mm_set1_pd(w[0])));
+		__m128d v2 = _mm_add_pd(v_b, _mm_mul_pd(r2p, _mm_set1_pd(w[1])));
+		__m128d vr = _mm_sub_pd(v2, v1);
+
+		__m128d vbn_vrn = _mm_hadd_pd(_mm_mul_pd(vbr, n), _mm_mul_pd(vr, n)); // TODO: _mm_dp_pd
+
+		__m128d v_offset = _mm_setr_pd(con->bias, -con->bounce);
+		__m128d jOld = _mm_setr_pd(con->jBias, con->jnAcc);
+		__m128d jbn_jn = _mm_mul_pd(_mm_sub_pd(v_offset, vbn_vrn), _mm_load1_pd(&con->nMass));
+		jbn_jn = _mm_max_pd(_mm_add_pd(jOld, jbn_jn), _mm_setzero_pd());
+		__m128d jApply = _mm_sub_pd(jbn_jn, jOld);
+
+		__m128d t = _mm_mul_pd(vrev(n), perp);
+		__m128d vrt_tmp = _mm_mul_pd(_mm_add_pd(vr, surface_vr), t);
+		__m128d vrt = _mm_hadd_pd(vrt_tmp, vrt_tmp);
+
+		__m128d jtOld = _mm_load_sd(&con->jtAcc);
+		__m128d jtMax = vrev(_mm_mul_pd(jbn_jn, _mm_load1_pd(&friction)));
+		__m128d jt = _mm_mul_pd(vrt, _mm_set1_pd(-con->tMass));
+		jt = _mm_max_pd(vneg(jtMax), _mm_min_pd(_mm_add_pd(jtOld, jt), jtMax));
+		__m128d jtApply = _mm_sub_pd(jt, jtOld);
+
+		__m128d i_inv = _mm_setr_pd(-a->i_inv, b->i_inv);
+		__m128d nperp = _mm_setr_pd(1.0, -1.0);
+
+		__m128d jBias = _mm_mul_pd(n, _mm_movedup_pd(jApply));
+		__m128d jBiasCross = _mm_mul_pd(vrev(jBias), nperp);
+		__m128d biasCrosses = _mm_hadd_pd(_mm_mul_pd(r1, jBiasCross), _mm_mul_pd(r2, jBiasCross)); // TODO: _mm_dp_pd
+		wBias = _mm_add_pd(wBias, _mm_mul_pd(i_inv, biasCrosses));
+
+		vBias_a = _mm_sub_pd(vBias_a, _mm_mul_pd(jBias, _mm_load1_pd(&a->m_inv)));
+		vBias_b = _mm_add_pd(vBias_b, _mm_mul_pd(jBias, _mm_load1_pd(&b->m_inv)));
+
+		__m128d j = _mm_add_pd(_mm_mul_pd(n, _mm_set1_pd(jApply[1])), _mm_mul_pd(t, _mm_movedup_pd(jtApply)));
+		__m128d jCross = _mm_mul_pd(vrev(j), nperp);
+		__m128d crosses = _mm_hadd_pd(_mm_mul_pd(r1, jCross), _mm_mul_pd(r2, jCross));  // TODO: _mm_dp_pd
+		w = _mm_add_pd(w, _mm_mul_pd(i_inv, crosses));
+
+		v_a = _mm_sub_pd(v_a, _mm_mul_pd(j, _mm_load1_pd(&a->m_inv)));
+		v_b = _mm_add_pd(v_b, _mm_mul_pd(j, _mm_load1_pd(&b->m_inv)));
+
+		// TODO would moving these earlier help pipeline them better?
+		_mm_storeu_pd((double*)&a->v_bias, vBias_a);
+		_mm_storeu_pd((double*)&b->v_bias, vBias_b);
+		_mm_storel_pd(&a->w_bias, wBias);
+		_mm_storeh_pd(&b->w_bias, wBias);
+
+		_mm_storeu_pd((double*)&a->v, v_a);
+		_mm_storeu_pd((double*)&b->v, v_b);
+		_mm_storel_pd(&a->w, w);
+		_mm_storeh_pd(&b->w, w);
+
+		_mm_storel_pd(&con->jBias, jbn_jn);
+		_mm_storeh_pd(&con->jnAcc, jbn_jn);
+		_mm_storel_pd(&con->jtAcc, jt);
+	}
+}
+
+#endif // __SSE3__
+
 //MARK: PThreads
 
 // Right now using more than 2 threads probably wont help your performance any.
@@ -276,6 +378,8 @@ Solver(cpSpace *space, unsigned long worker, unsigned long worker_count)
 			cpArbiter *arb = (cpArbiter *)arbiters->arr[j];
 			#ifdef __ARM_NEON__
 				cpArbiterApplyImpulse_NEON(arb);
+			#elif defined(__SSE3__)
+				cpArbiterApplyImpulse_SSE3(arb);
 			#else
 				cpArbiterApplyImpulse(arb);
 			#endif
